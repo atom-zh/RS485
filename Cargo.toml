@@ -1,0 +1,16 @@
+[package]
+name = "rs485-test"
+version = "0.1.0"
+edition = "2021"
+description = "QCM6125 RS485 半双工测试程序（GPIO_123 方向控制）"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ctrlc = { version = "3", features = ["termination"] }
+libc = "0.2"
+serialport = { version = "4.7", default-features = false }
+
+[profile.release]
+lto = false
+strip = true

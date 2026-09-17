@@ -1,0 +1,4 @@
+[target.aarch64-unknown-linux-musl]
+# linker 由 scripts/compile.sh 通过
+# CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER 注入，避免写死 gcc 文件名。
+rustflags = ["-C", "target-feature=+crt-static"]
