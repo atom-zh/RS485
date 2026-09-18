@@ -2,7 +2,7 @@ mod frame;
 mod gpio;
 mod uart;
 
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,13 +11,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use serialport::TTYPort;
+use serialport::{SerialPort, TTYPort};
 
 use crate::frame::{encode, inspect, pattern_payload, FrameView, SeqTracker};
 use crate::gpio::Gpio;
-use crate::uart::{open_port, read_frame, send_frame, IcountWatch, UartFormat};
+use crate::uart::{drain_available, open_port, read_frame, send_frame, IcountWatch, UartFormat};
 
 const MAX_IDLE_FRAME: usize = 8192;
+const REVERSE_MAX: usize = 8;
+const REVERSE_POLL: Duration = Duration::from_millis(10);
+const REVERSE_IDLE_TX: Duration = Duration::from_secs(6);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -98,6 +101,41 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         interval_ms: u64,
     },
+    /// 测试：首帧 1～8 字节倒序回发并缓存，之后只比对；6s 无接收则补发缓存
+    #[command(visible_alias = "test")]
+    Reverse,
+}
+
+struct ReverseCache {
+    input: [u8; REVERSE_MAX],
+    output: [u8; REVERSE_MAX],
+    len: usize,
+}
+
+impl ReverseCache {
+    fn from_first(data: &[u8]) -> Self {
+        debug_assert!(!data.is_empty() && data.len() <= REVERSE_MAX);
+        let len = data.len();
+        let mut input = [0u8; REVERSE_MAX];
+        let mut output = [0u8; REVERSE_MAX];
+        input[..len].copy_from_slice(data);
+        for i in 0..len {
+            output[i] = data[len - 1 - i];
+        }
+        Self {
+            input,
+            output,
+            len,
+        }
+    }
+
+    fn matches(&self, data: &[u8]) -> bool {
+        data.len() == self.len && data == &self.input[..self.len]
+    }
+
+    fn output(&self) -> &[u8] {
+        &self.output[..self.len]
+    }
 }
 
 struct Stats {
@@ -331,6 +369,7 @@ fn run() -> Result<()> {
             payload,
             interval_ms,
         } => run_traffic(&mut rt, &running, &stats, count, payload, interval_ms)?,
+        Command::Reverse => run_reverse(&mut rt, &running, &stats)?,
     }
 
     stats.print_counts("统计 ");
@@ -403,6 +442,106 @@ fn run_duplex(rt: Runtime, running: Arc<AtomicBool>, stats: Arc<Stats>) -> Resul
     }
     running.store(false, Ordering::SeqCst);
     rx.join().expect("接收线程 panic")?;
+    Ok(())
+}
+
+fn run_reverse(rt: &mut Runtime, running: &AtomicBool, stats: &Stats) -> Result<()> {
+    rt.port
+        .set_timeout(REVERSE_POLL)
+        .context("设置 reverse 读超时失败")?;
+    rt.gpio.set_rx()?;
+    stats.info(
+        "mode=reverse  首帧(≤8字节)倒序缓存，之后只比对；6s无接收则补发。Ctrl-C 退出。",
+    );
+
+    let mut cache: Option<ReverseCache> = None;
+    let mut last_rx = Instant::now();
+    let mut buf = [0u8; REVERSE_MAX];
+
+    while running.load(Ordering::SeqCst) {
+        match rt.port.read(&mut buf) {
+            Ok(0) => {
+                maybe_idle_reverse_tx(rt, cache.as_ref(), &mut last_rx, stats)?;
+                stats.maybe_print();
+            }
+            Ok(n) => {
+                let mut filled = n.min(REVERSE_MAX);
+                if filled < REVERSE_MAX {
+                    filled += drain_available(&mut rt.port, &mut buf[filled..])?;
+                }
+                let frame = &buf[..filled];
+                stats.on_rx(frame);
+                last_rx = Instant::now();
+
+                let mut out_buf = [0u8; REVERSE_MAX];
+                let reply_len = match &cache {
+                    None => {
+                        let c = ReverseCache::from_first(frame);
+                        let n = c.len;
+                        out_buf[..n].copy_from_slice(c.output());
+                        cache = Some(c);
+                        Some(n)
+                    }
+                    Some(c) if c.matches(frame) => {
+                        let n = c.len;
+                        out_buf[..n].copy_from_slice(c.output());
+                        Some(n)
+                    }
+                    Some(_) => {
+                        stats.info(&format!(
+                            "reverse mismatch len={} hex={}",
+                            frame.len(),
+                            format_hex(frame)
+                        ));
+                        None
+                    }
+                };
+                if let Some(n) = reply_len {
+                    send_frame(
+                        &mut rt.port,
+                        &rt.gpio,
+                        &out_buf[..n],
+                        rt.tx_setup,
+                        rt.tx_hold,
+                    )?;
+                    stats.on_tx(&out_buf[..n]);
+                }
+            }
+            Err(err)
+                if err.kind() == io::ErrorKind::TimedOut
+                    || err.kind() == io::ErrorKind::WouldBlock =>
+            {
+                maybe_idle_reverse_tx(rt, cache.as_ref(), &mut last_rx, stats)?;
+                stats.maybe_print();
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err).context("reverse 接收失败"),
+        }
+    }
+    Ok(())
+}
+
+fn maybe_idle_reverse_tx(
+    rt: &mut Runtime,
+    cache: Option<&ReverseCache>,
+    last_rx: &mut Instant,
+    stats: &Stats,
+) -> Result<()> {
+    let Some(cache) = cache else {
+        return Ok(());
+    };
+    if last_rx.elapsed() < REVERSE_IDLE_TX {
+        return Ok(());
+    }
+    send_frame(
+        &mut rt.port,
+        &rt.gpio,
+        cache.output(),
+        rt.tx_setup,
+        rt.tx_hold,
+    )?;
+    stats.on_tx(cache.output());
+    *last_rx = Instant::now();
     Ok(())
 }
 
@@ -575,4 +714,26 @@ fn format_hex(data: &[u8]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reverse_cache_first_frame() {
+        let c = ReverseCache::from_first(&[1, 2, 3, 4]);
+        assert_eq!(c.output(), &[4, 3, 2, 1]);
+        assert!(c.matches(&[1, 2, 3, 4]));
+        assert!(!c.matches(&[1, 2, 3]));
+        assert!(!c.matches(&[1, 2, 3, 5]));
+        assert!(!c.matches(&[4, 3, 2, 1]));
+    }
+
+    #[test]
+    fn reverse_cache_single_byte() {
+        let c = ReverseCache::from_first(&[0xa5]);
+        assert_eq!(c.output(), &[0xa5]);
+        assert!(c.matches(&[0xa5]));
+    }
 }

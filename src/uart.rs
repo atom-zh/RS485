@@ -102,6 +102,37 @@ pub fn send_frame(
     Ok(())
 }
 
+/// 把内核接收缓冲里已经到达的字节抽进 `dest`，不等待后续数据。
+/// `FIONREAD` 失败时返回 0，不阻塞。
+pub fn drain_available(port: &mut TTYPort, dest: &mut [u8]) -> io::Result<usize> {
+    if dest.is_empty() {
+        return Ok(0);
+    }
+    let fd = port.as_raw_fd();
+    let mut avail: libc::c_int = 0;
+    let rc = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut avail) };
+    if rc < 0 || avail <= 0 {
+        return Ok(0);
+    }
+    let want = (avail as usize).min(dest.len());
+    let mut got = 0usize;
+    while got < want {
+        match port.read(&mut dest[got..want]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err)
+                if err.kind() == io::ErrorKind::TimedOut
+                    || err.kind() == io::ErrorKind::WouldBlock =>
+            {
+                break;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(got)
+}
+
 pub fn read_frame(port: &mut TTYPort, max_len: usize) -> io::Result<Option<Vec<u8>>> {
     let mut frame = Vec::new();
     let mut tmp = [0u8; 256];

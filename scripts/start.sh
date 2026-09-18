@@ -8,6 +8,7 @@
 #   QUIET=1 MODE=echo ./scripts/start.sh
 #   QUIET=1 CRC=1 MODE=recv ./scripts/start.sh
 #   MODE=traffic COUNT=1000 PAYLOAD=32 INTERVAL_MS=20 ./scripts/start.sh
+#   MODE=reverse ./scripts/start.sh
 set -euo pipefail
 
 DEVICE="${DEVICE:-/dev/ttyHS3}"
@@ -107,7 +108,8 @@ case "$MODE" in
   traffic)
     cmd+=(traffic --count "$COUNT" --payload "$PAYLOAD" --interval-ms "$INTERVAL_MS")
     ;;
-  *) die "未知 MODE=$MODE（duplex|echo|recv|send|traffic）" ;;
+  reverse|test) cmd+=(reverse) ;;
+  *) die "未知 MODE=$MODE（duplex|echo|recv|send|traffic|reverse）" ;;
 esac
 
 if [[ -n "$EXTRA_ARGS" ]]; then

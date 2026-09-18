@@ -39,7 +39,7 @@ QCM6125 上的 RS485 为半双工：同一物理链路不能同时发和收，�
 - 交叉编译出 **aarch64 musl 静态二进制**，拷到板子即可运行。
 - 默认适配本项目硬件：`/dev/ttyHS3` + GPIO123 + 115200 + `N8N1`。
 - 空闲时保持 RX，发送时按「拉低 → 等待 setup → 写串口 → tcdrain → 等待 hold → 拉高」切换。
-- 提供 duplex / echo / send / recv / traffic 五种工作模式。
+- 提供 duplex / echo / send / recv / traffic / reverse 六种工作模式。
 - 可选按测试帧做 CRC、序号丢包/重复统计；利用内核 `TIOCGICOUNT` 报告帧错、奇偶、溢出。
 - 提供 `scripts/start.sh` / `scripts/stop.sh` 做后台启停，停止后 GPIO 回到 RX。
 
@@ -107,8 +107,9 @@ GPIO=1 (RX, 空闲)
 | F-MODE-03 | send | 发送一次文本 **或** `--file` 内容（二者互斥且必填其一）；`--stay` 时发完转入 recv |
 | F-MODE-04 | recv | GPIO 保持 RX，只收不发 |
 | F-MODE-05 | traffic | 连续发送带序号+CRC 的测试帧；`--count 0` 表示直到 Ctrl-C；可配 payload 长度与帧间隔 |
+| F-MODE-06 | reverse（别名 test） | 启动后第一帧 1～8 字节立即倒序回发并冻结缓存；之后只比对是否与首帧相同，相同则直接发缓存，不同则不回发、不改缓存。读到数据后用 `FIONREAD` 抽干内核已到字节（最多 8），不等待 `frame_idle_ms`。有缓存且超过 6 秒无接收则把缓存倒序主动发送一次，并重置静默计时（持续静默则每 6 秒一次）。本模式串口读超时约 10ms，仅用于轮询空闲与 Ctrl-C |
 
-空闲组帧规则：读超时或读到 0 字节且缓冲区非空时，把已累积字节视为一帧；单帧上限 8192 字节。
+空闲组帧规则（duplex / echo / recv）：读超时或读到 0 字节且缓冲区非空时，把已累积字节视为一帧；单帧上限 8192 字节。`reverse` 不走该规则。
 
 ### 5.3 测试帧协议（仅 traffic 发送 / `--crc` 校验）
 
@@ -178,12 +179,13 @@ GPIO=1 (RX, 空闲)
 4. 板上 echo，对端发出的数据能原样收回。
 5. duplex 下从板上 stdin 输入一行，对端收到该行加换行。
 6. 一侧 `traffic --count 100`，另一侧 `recv --crc -q`，CRC 通过数与发送帧数一致（短线、无干扰时允许 0 丢包）。
-7. `stop.sh` 后进程不在、GPIO value 为 1。
-8. 无 root 或设备不存在时，start 脚本在拉起前失败并给出原因。
+7. 板上 `reverse`，对端反复发送同一段 1～8 字节，板上回倒序；超过 6 秒无接收则主动再发一次缓存倒序。
+8. `stop.sh` 后进程不在、GPIO value 为 1。
+9. 无 root 或设备不存在时，start 脚本在拉起前失败并给出原因。
 
 ## 8. 风险与约束
 
-- 半双工无冲突检测：两端同时发会破坏波形，echo/traffic 需约定主从。
+- 半双工无冲突检测：两端同时发会破坏波形，echo/reverse/traffic 需约定主从。
 - `frame_idle_ms` 过小会把一帧拆成多段；过大则统计延迟增加。对端若连续发送无间隙，可能并成超大帧（上限 8192）。
 - sysfs GPIO 在部分内核上已弃用；若板子只用 libgpiod 且无 sysfs，本期无法工作。
 - `TIOCGICOUNT` 依赖驱动实现，部分 tty 返回不可用，此时不阻断收发。
