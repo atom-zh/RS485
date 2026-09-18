@@ -65,30 +65,6 @@ impl UartFormat {
             stop_bits,
         })
     }
-
-    pub fn bits_per_byte(self) -> u32 {
-        let data = match self.data_bits {
-            DataBits::Five => 5,
-            DataBits::Six => 6,
-            DataBits::Seven => 7,
-            DataBits::Eight => 8,
-        };
-        let parity = match self.parity {
-            Parity::None => 0,
-            _ => 1,
-        };
-        let stop = match self.stop_bits {
-            StopBits::One => 1,
-            StopBits::Two => 2,
-        };
-        1 + data + parity + stop
-    }
-}
-
-pub fn default_tx_hold_us(baud: u32, format: UartFormat) -> u64 {
-    let baud = baud.max(1) as u64;
-    let byte_us = (format.bits_per_byte() as u64 * 1_000_000).div_ceil(baud);
-    byte_us.saturating_mul(2).max(50)
 }
 
 pub fn open_port(
@@ -119,7 +95,9 @@ pub fn send_frame(
         .context("RS485 写入失败")?;
     port.flush().context("RS485 flush 失败")?;
     drain_port(port);
-    thread::sleep(tx_hold);
+    if !tx_hold.is_zero() {
+        thread::sleep(tx_hold);
+    }
     gpio.set_rx()?;
     Ok(())
 }

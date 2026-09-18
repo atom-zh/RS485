@@ -15,9 +15,7 @@ use serialport::TTYPort;
 
 use crate::frame::{encode, inspect, pattern_payload, FrameView, SeqTracker};
 use crate::gpio::Gpio;
-use crate::uart::{
-    default_tx_hold_us, open_port, read_frame, send_frame, IcountWatch, UartFormat,
-};
+use crate::uart::{open_port, read_frame, send_frame, IcountWatch, UartFormat};
 
 const MAX_IDLE_FRAME: usize = 8192;
 
@@ -47,9 +45,9 @@ struct Cli {
     #[arg(long, default_value_t = 50)]
     tx_setup_us: u64,
 
-    /// 写完并 tcdrain 后、拉高 RX 前的等待（微秒）。默认 2 个字节时间
-    #[arg(long)]
-    tx_hold_us: Option<u64>,
+    /// 写完并 tcdrain 后、拉高 RX 前的等待（微秒）。默认 0：发完立刻切接收
+    #[arg(long, default_value_t = 0)]
+    tx_hold_us: u64,
 
     /// 帧间隔空闲判定（毫秒）
     #[arg(long, default_value_t = 30)]
@@ -278,9 +276,6 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let format = UartFormat::parse(&cli.format)?;
-    let tx_hold_us = cli
-        .tx_hold_us
-        .unwrap_or_else(|| default_tx_hold_us(cli.baud, format));
     let timeout = Duration::from_millis(cli.frame_idle_ms.max(5));
 
     let gpio = Gpio::open(cli.gpio)?;
@@ -289,7 +284,7 @@ fn run() -> Result<()> {
         port,
         gpio,
         tx_setup: Duration::from_micros(cli.tx_setup_us),
-        tx_hold: Duration::from_micros(tx_hold_us),
+        tx_hold: Duration::from_micros(cli.tx_hold_us),
     };
 
     let icount = IcountWatch::new(&rt.port);
@@ -306,7 +301,7 @@ fn run() -> Result<()> {
         cli.format.to_ascii_uppercase(),
         cli.gpio,
         cli.tx_setup_us,
-        tx_hold_us,
+        cli.tx_hold_us,
         timeout.as_millis(),
         cli.crc,
         cli.stats_interval_ms
