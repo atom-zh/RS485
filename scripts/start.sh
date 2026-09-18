@@ -5,6 +5,9 @@
 #   MODE=duplex BAUD=115200 ./scripts/start.sh
 #   MODE=recv ./scripts/start.sh
 #   MODE=send SEND_TEXT='hello' ./scripts/start.sh
+#   QUIET=1 MODE=echo ./scripts/start.sh
+#   QUIET=1 CRC=1 MODE=recv ./scripts/start.sh
+#   MODE=traffic COUNT=1000 PAYLOAD=32 INTERVAL_MS=20 ./scripts/start.sh
 set -euo pipefail
 
 DEVICE="${DEVICE:-/dev/ttyHS3}"
@@ -15,6 +18,12 @@ MODE="${MODE:-duplex}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 SEND_TEXT="${SEND_TEXT:-}"
 STAY="${STAY:-0}"
+QUIET="${QUIET:-0}"
+CRC="${CRC:-0}"
+COUNT="${COUNT:-0}"
+PAYLOAD="${PAYLOAD:-32}"
+INTERVAL_MS="${INTERVAL_MS:-20}"
+STATS_INTERVAL_MS="${STATS_INTERVAL_MS:-}"
 LOG="${LOG:-/tmp/rs485-test.log}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -75,6 +84,15 @@ echo 1 > "$GPIO_DIR/value"
 log "GPIO${GPIO}=1 (RX)"
 
 cmd=("$BIN" -d "$DEVICE" -b "$BAUD" --format "$FORMAT" -g "$GPIO")
+if [[ "$QUIET" == "1" || "$QUIET" == "true" || "$QUIET" == "yes" ]]; then
+  cmd+=(-q)
+fi
+if [[ "$CRC" == "1" || "$CRC" == "true" || "$CRC" == "yes" ]]; then
+  cmd+=(--crc)
+fi
+if [[ -n "$STATS_INTERVAL_MS" ]]; then
+  cmd+=(--stats-interval-ms "$STATS_INTERVAL_MS")
+fi
 case "$MODE" in
   duplex) cmd+=(duplex) ;;
   echo) cmd+=(echo) ;;
@@ -86,7 +104,10 @@ case "$MODE" in
       cmd+=(--stay)
     fi
     ;;
-  *) die "未知 MODE=$MODE（duplex|echo|recv|send）" ;;
+  traffic)
+    cmd+=(traffic --count "$COUNT" --payload "$PAYLOAD" --interval-ms "$INTERVAL_MS")
+    ;;
+  *) die "未知 MODE=$MODE（duplex|echo|recv|send|traffic）" ;;
 esac
 
 if [[ -n "$EXTRA_ARGS" ]]; then

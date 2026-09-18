@@ -168,3 +168,89 @@ fn drain_port(port: &TTYPort) {
         thread::sleep(Duration::from_millis(2));
     }
 }
+
+/// 相对打开串口后的 UART 线路错误计数（TIOCGICOUNT 差值）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UartCounters {
+    pub frame: u64,
+    pub overrun: u64,
+    pub parity: u64,
+    pub brk: u64,
+    pub buf_overrun: u64,
+}
+
+impl UartCounters {
+    pub fn error_total(self) -> u64 {
+        self.frame
+            .saturating_add(self.overrun)
+            .saturating_add(self.parity)
+            .saturating_add(self.brk)
+            .saturating_add(self.buf_overrun)
+    }
+
+    fn saturating_delta(self, baseline: Self) -> Self {
+        Self {
+            frame: self.frame.saturating_sub(baseline.frame),
+            overrun: self.overrun.saturating_sub(baseline.overrun),
+            parity: self.parity.saturating_sub(baseline.parity),
+            brk: self.brk.saturating_sub(baseline.brk),
+            buf_overrun: self.buf_overrun.saturating_sub(baseline.buf_overrun),
+        }
+    }
+}
+
+#[repr(C)]
+struct SerialIcounter {
+    cts: i32,
+    dsr: i32,
+    rng: i32,
+    dcd: i32,
+    rx: i32,
+    tx: i32,
+    frame: i32,
+    overrun: i32,
+    parity: i32,
+    brk: i32,
+    buf_overrun: i32,
+    reserved: [i32; 9],
+}
+
+fn as_cnt(v: i32) -> u64 {
+    v.max(0) as u64
+}
+
+pub fn read_icount(fd: i32) -> Option<UartCounters> {
+    let mut ic = unsafe { std::mem::zeroed::<SerialIcounter>() };
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGICOUNT, &mut ic) };
+    if rc < 0 {
+        None
+    } else {
+        Some(UartCounters {
+            frame: as_cnt(ic.frame),
+            overrun: as_cnt(ic.overrun),
+            parity: as_cnt(ic.parity),
+            brk: as_cnt(ic.brk),
+            buf_overrun: as_cnt(ic.buf_overrun),
+        })
+    }
+}
+
+pub struct IcountWatch {
+    fd: i32,
+    baseline: Option<UartCounters>,
+}
+
+impl IcountWatch {
+    pub fn new(port: &TTYPort) -> Self {
+        let fd = port.as_raw_fd();
+        Self {
+            fd,
+            baseline: read_icount(fd),
+        }
+    }
+
+    pub fn delta(&self) -> Option<UartCounters> {
+        let now = read_icount(self.fd)?;
+        Some(now.saturating_delta(self.baseline?))
+    }
+}
