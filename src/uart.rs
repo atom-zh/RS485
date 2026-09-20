@@ -8,6 +8,9 @@ use serialport::{DataBits, FlowControl, Parity, StopBits, TTYPort};
 
 use crate::gpio::Gpio;
 
+/// 方向切换等待下限（微秒）。覆盖 GPIO / 软件余量；SIT3088E 开关远小于此值。
+pub const TX_TIMING_FLOOR_US: u64 = 50;
+
 #[derive(Clone, Copy, Debug)]
 pub struct UartFormat {
     pub parity: Parity,
@@ -65,6 +68,44 @@ impl UartFormat {
             stop_bits,
         })
     }
+
+    /// 起始位 + 数据位 + 校验位 + 停止位。`N8N1` = 10，`E8N1` / `N8N2` = 11。
+    pub fn bits_per_char(&self) -> u32 {
+        let data = match self.data_bits {
+            DataBits::Five => 5,
+            DataBits::Six => 6,
+            DataBits::Seven => 7,
+            DataBits::Eight => 8,
+        };
+        let parity = match self.parity {
+            Parity::None => 0,
+            _ => 1,
+        };
+        let stop = match self.stop_bits {
+            StopBits::One => 1,
+            StopBits::Two => 2,
+        };
+        1 + data + parity + stop
+    }
+}
+
+/// 一字节线上时间（微秒），向上取整。
+pub fn byte_time_us(baud: u32, bits: u32) -> u64 {
+    let baud = u64::from(baud.max(1));
+    let bits = u64::from(bits.max(1));
+    (bits.saturating_mul(1_000_000) + baud - 1) / baud
+}
+
+/// 未指定 `--tx-setup-us` 时：1 字节时间，下限 [`TX_TIMING_FLOOR_US`]。
+pub fn default_tx_setup_us(baud: u32, format: &UartFormat) -> u64 {
+    byte_time_us(baud, format.bits_per_char()).max(TX_TIMING_FLOOR_US)
+}
+
+/// 未指定 `--tx-hold-us` 时：2 字节时间，下限 [`TX_TIMING_FLOOR_US`]。
+pub fn default_tx_hold_us(baud: u32, format: &UartFormat) -> u64 {
+    byte_time_us(baud, format.bits_per_char())
+        .saturating_mul(2)
+        .max(TX_TIMING_FLOOR_US)
 }
 
 pub fn open_port(
@@ -261,5 +302,56 @@ impl IcountWatch {
     pub fn delta(&self) -> Option<UartCounters> {
         let now = read_icount(self.fd)?;
         Some(now.saturating_delta(self.baseline?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fmt(s: &str) -> UartFormat {
+        UartFormat::parse(s).unwrap()
+    }
+
+    #[test]
+    fn bits_per_char_n8n1_e8n1_n8n2() {
+        assert_eq!(fmt("N8N1").bits_per_char(), 10);
+        assert_eq!(fmt("E8N1").bits_per_char(), 11);
+        assert_eq!(fmt("N8N2").bits_per_char(), 11);
+        assert_eq!(fmt("O7N1").bits_per_char(), 10);
+    }
+
+    #[test]
+    fn tx_timing_115200_n8n1() {
+        let f = fmt("N8N1");
+        assert_eq!(byte_time_us(115200, 10), 87);
+        assert_eq!(default_tx_setup_us(115200, &f), 87);
+        assert_eq!(default_tx_hold_us(115200, &f), 174);
+    }
+
+    #[test]
+    fn tx_timing_921600_n8n1_hits_floor() {
+        let f = fmt("N8N1");
+        assert_eq!(byte_time_us(921600, 10), 11);
+        assert_eq!(default_tx_setup_us(921600, &f), TX_TIMING_FLOOR_US);
+        assert_eq!(default_tx_hold_us(921600, &f), TX_TIMING_FLOOR_US);
+        assert_eq!(TX_TIMING_FLOOR_US, 50);
+    }
+
+    #[test]
+    fn tx_timing_9600_n8n1_above_floor() {
+        let f = fmt("N8N1");
+        assert_eq!(byte_time_us(9600, 10), 1042);
+        assert_eq!(default_tx_setup_us(9600, &f), 1042);
+        assert_eq!(default_tx_hold_us(9600, &f), 2084);
+    }
+
+    #[test]
+    fn tx_timing_e8n1_eleven_bits() {
+        let f = fmt("E8N1");
+        assert_eq!(f.bits_per_char(), 11);
+        assert_eq!(byte_time_us(115200, 11), 96);
+        assert_eq!(default_tx_setup_us(115200, &f), 96);
+        assert_eq!(default_tx_hold_us(115200, &f), 192);
     }
 }

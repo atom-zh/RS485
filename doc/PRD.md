@@ -71,9 +71,9 @@ QCM6125 上的 RS485 为半双工：同一物理链路不能同时发和收，�
 GPIO=1 (RX, 空闲)
     │
     ├─ set_tx: GPIO=0
-    ├─ sleep tx_setup（默认 50 µs）
+    ├─ sleep tx_setup（默认 1 字节时间，下限 50 µs）
     ├─ write + flush + tcdrain
-    ├─ sleep tx_hold（默认约 2 个字节时间，下限 50 µs）
+    ├─ sleep tx_hold（默认 2 字节时间，下限 50 µs）
     └─ set_rx: GPIO=1
 ```
 
@@ -87,8 +87,8 @@ GPIO=1 (RX, 空闲)
 |---------|------|--------|
 | F-CFG-01 | 可指定设备、波特率、uarttest 格式（`N8N1` 或 `115200N8N1`） | P0 |
 | F-CFG-02 | 可指定方向 GPIO；首次使用时 export 并设为 output，默认拉高 RX | P0 |
-| F-CFG-03 | `tx_setup_us` 控制拉低后、写串口前等待；默认 50 µs | P0 |
-| F-CFG-04 | `tx_hold_us` 控制 tcdrain 后、拉高前等待；未指定时按「2 字节时间」计算 | P0 |
+| F-CFG-03 | `tx_setup_us` 控制拉低后、写串口前等待；未指定时按「1 字节时间」计算，下限 50 µs | P0 |
+| F-CFG-04 | `tx_hold_us` 控制 tcdrain 后、拉高前等待；未指定时按「2 字节时间」计算，下限 50 µs | P0 |
 | F-CFG-05 | `frame_idle_ms` 作为串口读超时，用于空闲组帧；默认 30 ms，内部下限 5 ms | P0 |
 | F-CFG-06 | `--format` 支持校验 N/O/E、数据位 5–8、流控 Y/N、停止位 1/2；`S` 明确报错 | P1 |
 | F-CFG-07 | `-q/--quiet` 不打印报文正文，只打统计；`--stats-interval-ms` 控制统计节流（默认 1000，0 表示每包） | P1 |
