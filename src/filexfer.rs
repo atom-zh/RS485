@@ -1,7 +1,8 @@
 //! 文件传输：测试帧 payload 内的 META / DATA / ACK，以及接收侧 MD5 校验状态机。
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
@@ -291,6 +292,7 @@ struct InFlight {
     next_idx: u32,
     written: u64,
     path: PathBuf,
+    file: File,
     last_activity: Instant,
 }
 
@@ -372,7 +374,7 @@ impl RecvEngine {
         };
         let path = self.dir.join(format!("recv-{xfer_id}.part"));
         let _ = fs::remove_file(&path);
-        File::create(&path)?;
+        let file = File::create(&path)?;
         self.current = Some(InFlight {
             xfer_id,
             file_size,
@@ -380,6 +382,7 @@ impl RecvEngine {
             next_idx: 0,
             written: 0,
             path,
+            file,
             last_activity: Instant::now(),
         });
         Ok(match aborted {
@@ -402,13 +405,8 @@ impl RecvEngine {
         if cur.written.saturating_add(add) > cur.file_size {
             return Ok(FeedResult::Done(self.fail_incomplete("分片超出文件长度")?));
         }
-        {
-            let cur = self.current.as_ref().unwrap();
-            let mut f = OpenOptions::new().append(true).open(&cur.path)?;
-            f.write_all(data)?;
-            f.flush()?;
-        }
         let cur = self.current.as_mut().unwrap();
+        cur.file.write_all(data)?;
         cur.written += add;
         cur.next_idx += 1;
         cur.last_activity = Instant::now();
@@ -423,6 +421,8 @@ impl RecvEngine {
 
     fn finish_complete(&mut self) -> io::Result<RecvOutcome> {
         let cur = self.current.take().expect("finish 需要进行中的传输");
+        persist_and_drop_cache(&cur.file)?;
+        drop(cur.file);
         let got = md5_file(&cur.path)?;
         let mut recorded_golden = false;
         let expect = if let Some(preset) = self.expect_md5 {
@@ -453,6 +453,8 @@ impl RecvEngine {
 
     fn fail_incomplete(&mut self, _why: &str) -> io::Result<RecvOutcome> {
         let cur = self.current.take().expect("fail 需要进行中的传输");
+        let _ = persist_and_drop_cache(&cur.file);
+        drop(cur.file);
         let got = md5_file(&cur.path).unwrap_or([0u8; MD5_LEN]);
         let kept = keep_fail(&self.dir, cur.xfer_id, &got, &cur.path, self.max_fail_keep)?;
         Ok(RecvOutcome {
@@ -464,6 +466,14 @@ impl RecvEngine {
             kept_path: Some(kept),
         })
     }
+}
+
+/// 先 fsync 到设备，再建议内核丢掉本文件页缓存，随后由调用方关闭并重开回读。
+/// `posix_fadvise` 失败不视为错误（tmpfs 等可能不支持），回读仍可能命中页缓存。
+fn persist_and_drop_cache(file: &File) -> io::Result<()> {
+    file.sync_all()?;
+    let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    Ok(())
 }
 
 fn keep_fail(
@@ -683,6 +693,20 @@ mod tests {
         assert!(!out.recorded_golden);
         assert!(eng.golden().is_none());
         assert!(out.kept_path.unwrap().exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_then_reread_md5() {
+        let dir = temp_dir();
+        let path = dir.join("cold.bin");
+        let data = b"cold-read-payload";
+        {
+            let mut f = File::create(&path).unwrap();
+            f.write_all(data).unwrap();
+            persist_and_drop_cache(&f).unwrap();
+        }
+        assert_eq!(md5_file(&path).unwrap(), md5_bytes(data));
         let _ = fs::remove_dir_all(&dir);
     }
 

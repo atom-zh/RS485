@@ -109,7 +109,7 @@ GPIO=1 (RX, 空闲)
 | F-MODE-05 | traffic | 连续发送带序号+CRC 的测试帧；`--count 0` 表示直到 Ctrl-C；可配 payload 长度与帧间隔 |
 | F-MODE-06 | reverse（别名 test） | 启动后第一帧 1～8 字节立即倒序回发并冻结缓存；之后只比对是否与首帧相同，相同则直接发缓存，不同则不回发、不改缓存。读到数据后用 `FIONREAD` 抽干内核已到字节（最多 8），不等待 `frame_idle_ms`。有缓存且超过 6 秒无接收则把缓存倒序主动发送一次，并重置静默计时（持续静默则每 6 秒一次）。本模式串口读超时约 10ms，仅用于轮询空闲与 Ctrl-C |
 | F-MODE-07 | file-send | 循环分片发送指定文件（默认 1024 字节/片、片间隔 20 ms）。启动时计算源文件 MD5 并写入 META；`--md5` 可选，传入则必须与本地计算结果一致。每轮发完等待文件级 ACK（默认 15 s），超时只记统计不中止。`--count 0` 直到 Ctrl-C |
-| F-MODE-08 | file-recv | 按 META/DATA 重组落盘。收齐后对磁盘文件算 MD5：有 `--expect-md5` 则每轮必须匹配；未传入则以**第一份收齐的文件**为基准并自动记录（半截/缺片/超时不记基准）。通过则删除，失败则保留 `fail-xfer*`（`--max-fail-keep` 默认 16）。随后回 ACK |
+| F-MODE-08 | file-recv | 按 META/DATA 重组落盘。收齐后 `fsync`，对该文件 `posix_fadvise(DONTNEED)` 剔除页缓存，再重新打开算 MD5：有 `--expect-md5` 则每轮必须匹配；未传入则以**第一份收齐的文件**为基准并自动记录（半截/缺片/超时不记基准）。通过则删除，失败则保留 `fail-xfer*`（`--max-fail-keep` 默认 16）。随后回 ACK |
 
 空闲组帧规则（duplex / echo / recv / file-send 的 ACK 等待 / file-recv）：读超时或读到 0 字节且缓冲区非空时，把已累积字节视为一帧；单帧上限 8192 字节。`reverse` 不走该规则。
 
@@ -201,6 +201,7 @@ GPIO=1 (RX, 空闲)
 
 - 半双工无冲突检测：两端同时发会破坏波形，echo/reverse/traffic/file-send 需约定主从（一侧 file-send，一侧 file-recv）。
 - `file-recv` 未传 `--expect-md5` 时，若第一份收齐的文件其实已损坏，基准会锁错，后续正确文件会被当成失败。
+- `file-recv` 收齐后会 fsync 并以 `posix_fadvise(DONTNEED)` 剔除该文件页缓存再回读。`--dir` 若在 tmpfs（常见于 `/tmp`）上，fadvise 可能无效，MD5 仍可能来自内存。
 - `frame_idle_ms` 过小会把一帧拆成多段；过大则统计延迟增加。对端若连续发送无间隙，可能并成超大帧（上限 8192）。file-send 默认片间隔 20 ms，避免粘包切断。
 - sysfs GPIO 在部分内核上已弃用；若板子只用 libgpiod 且无 sysfs，本期无法工作。
 - `TIOCGICOUNT` 依赖驱动实现，部分 tty 返回不可用，此时不阻断收发。

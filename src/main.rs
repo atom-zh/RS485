@@ -115,35 +115,37 @@ enum Command {
     Reverse,
     /// 循环分片发送文件，等待对端文件级 ACK
     FileSend {
+        /// 源文件路径（必填，不能为空）
         #[arg(long)]
         file: PathBuf,
-        /// 期望 MD5（32 位 hex）；省略则按源文件计算
+        /// 期望 MD5（32 位 hex）；给出则必须与本地计算结果一致
         #[arg(long)]
         md5: Option<String>,
         /// 发送轮数，0 表示直到 Ctrl-C
         #[arg(long, default_value_t = 0)]
         count: u64,
-        /// 每片数据字节数
+        /// 每片数据字节数（1 到单帧上限，默认 1024）
         #[arg(long, default_value_t = DEFAULT_CHUNK)]
         chunk: usize,
-        /// 片间隔（毫秒）
+        /// META/DATA 片间隔（毫秒）
         #[arg(long, default_value_t = 20)]
         interval_ms: u64,
-        /// 等待 ACK 超时（毫秒）
+        /// 一轮发完后等待 ACK 的超时（毫秒）；超时不中止
         #[arg(long, default_value_t = 15000)]
         ack_timeout_ms: u64,
     },
-    /// 循环接收文件：MD5 通过则删除，失败则保留
+    /// 循环接收文件：落盘并剔除页缓存后再算 MD5，通过则删除，失败则保留
     FileRecv {
+        /// 落盘目录；应指向真实分区（tmpfs 上剔除页缓存可能无效）
         #[arg(long, default_value = "/tmp/rs485-rx")]
         dir: PathBuf,
         /// 期望 MD5（32 位 hex）；省略则以第一份收齐的文件为基准
         #[arg(long)]
         expect_md5: Option<String>,
-        /// 收片空闲超时（毫秒）
+        /// 收片空闲超时（毫秒），超时则本轮失败并保留
         #[arg(long, default_value_t = 5000)]
         idle_timeout_ms: u64,
-        /// 最多保留的失败样本数
+        /// 最多保留的失败样本数（fail-xfer*）
         #[arg(long, default_value_t = 16)]
         max_fail_keep: usize,
     },
@@ -1000,7 +1002,7 @@ fn run_file_recv(
         "file-recv dir={} expect_md5={expect_txt} idle_timeout={idle_timeout_ms}ms max_fail_keep={max_fail_keep}",
         dir.display()
     ));
-    stats.info("mode=file-recv  收齐后校验 MD5，通过删除、失败保留。Ctrl-C 退出。");
+    stats.info("mode=file-recv  收齐后 fsync 并剔除页缓存再校验 MD5，通过删除、失败保留。Ctrl-C 退出。");
     rt.gpio.set_rx()?;
     let mut seq = 0u32;
     while running.load(Ordering::SeqCst) {
