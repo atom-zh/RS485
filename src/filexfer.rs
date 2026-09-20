@@ -325,6 +325,7 @@ impl RecvEngine {
         self.golden
     }
 
+    #[cfg(test)]
     pub fn inflight(&self) -> bool {
         self.current.is_some()
     }
