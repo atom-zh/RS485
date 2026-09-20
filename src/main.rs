@@ -16,8 +16,8 @@ use clap::{Parser, Subcommand};
 use serialport::{SerialPort, TTYPort};
 
 use crate::filexfer::{
-    chunk_count, encode_wire, md5_file, md5_hex, parse_md5_hex, parse_msgs, FeedResult, FileMsg,
-    RecvEngine, RecvOutcome, ACK_OK, DEFAULT_CHUNK, MAX_CHUNK,
+    chunk_count, encode_wire, md5_file, md5_hex, parse_events, parse_md5_hex, parse_msgs, FeedResult,
+    FileMsg, ParseEvent, RecvEngine, RecvOutcome, ACK_OK, DEFAULT_CHUNK, MAX_CHUNK,
 };
 use crate::frame::{encode, inspect, pattern_payload, FrameView, SeqTracker};
 use crate::gpio::Gpio;
@@ -134,18 +134,18 @@ enum Command {
         #[arg(long, default_value_t = 15000)]
         ack_timeout_ms: u64,
     },
-    /// 循环接收文件：落盘并剔除页缓存后再算 MD5，通过则删除，失败则保留
+    /// 循环接收文件：出错继续收、原样落盘；第一份收齐的文件保留，之后通过则删、失败则留
     FileRecv {
         /// 落盘目录；应指向真实分区（tmpfs 上剔除页缓存可能无效）
         #[arg(long, default_value = "/tmp/rs485-rx")]
         dir: PathBuf,
-        /// 期望 MD5（32 位 hex）；省略则以第一份收齐的文件为基准
+        /// 期望 MD5（32 位 hex）；省略则以第一份收齐的文件为基准并保留 first-xfer*
         #[arg(long)]
         expect_md5: Option<String>,
         /// 收片空闲超时（毫秒），超时则本轮失败并保留
         #[arg(long, default_value_t = 5000)]
         idle_timeout_ms: u64,
-        /// 最多保留的失败样本数（fail-xfer*）
+        /// 最多保留的失败样本数（fail-xfer*，不含 first-*）
         #[arg(long, default_value_t = 16)]
         max_fail_keep: usize,
     },
@@ -1002,15 +1002,27 @@ fn run_file_recv(
         "file-recv dir={} expect_md5={expect_txt} idle_timeout={idle_timeout_ms}ms max_fail_keep={max_fail_keep}",
         dir.display()
     ));
-    stats.info("mode=file-recv  收齐后 fsync 并剔除页缓存再校验 MD5，通过删除、失败保留。Ctrl-C 退出。");
+    stats.info("mode=file-recv  出错继续收并原样落盘；第一份收齐保留为 first-xfer*，之后通过删除、失败保留。Ctrl-C 退出。");
     rt.gpio.set_rx()?;
     let mut seq = 0u32;
     while running.load(Ordering::SeqCst) {
         match read_frame(&mut rt.port, MAX_IDLE_FRAME) {
             Ok(Some(raw)) => {
                 stats.on_rx(&raw);
-                for msg in parse_msgs(&raw) {
-                    apply_recv_feed(rt, stats, &mut engine, &mut seq, msg)?;
+                for ev in parse_events(&raw) {
+                    match ev {
+                        ParseEvent::Msg(msg) => {
+                            apply_recv_feed(rt, stats, &mut engine, &mut seq, msg)?;
+                        }
+                        ParseEvent::BadFrame { kind, raw } => {
+                            apply_recv_feed_result(
+                                rt,
+                                stats,
+                                &mut seq,
+                                engine.note_bad_frame(kind, &raw).context("写入坏帧失败")?,
+                            )?;
+                        }
+                    }
                 }
             }
             Ok(None) => {
@@ -1041,8 +1053,26 @@ fn apply_recv_feed(
     seq: &mut u32,
     msg: FileMsg,
 ) -> Result<()> {
-    match engine.feed(msg).context("写入接收文件失败")? {
+    apply_recv_feed_result(
+        rt,
+        stats,
+        seq,
+        engine.feed(msg).context("写入接收文件失败")?,
+    )
+}
+
+fn apply_recv_feed_result(
+    rt: &mut Runtime,
+    stats: &Stats,
+    seq: &mut u32,
+    result: FeedResult,
+) -> Result<()> {
+    match result {
         FeedResult::Nothing => Ok(()),
+        FeedResult::Note(note) => {
+            log_line(&note.log_line());
+            Ok(())
+        }
         FeedResult::Done(out) => finish_recv_outcome(rt, stats, seq, out),
         FeedResult::AbortedPrevious(out) => finish_recv_outcome(rt, stats, seq, out),
     }
@@ -1065,7 +1095,13 @@ fn finish_recv_outcome(
         result: out.ack_result(),
         got_md5: out.got_md5,
     };
-    send_file_msg(rt, stats, seq, &ack)
+    if let Err(err) = send_file_msg(rt, stats, seq, &ack) {
+        log_line(&format!(
+            "file xfer={} ACK发送失败: {err:#} 继续",
+            out.xfer_id
+        ));
+    }
+    Ok(())
 }
 
 fn sleep_while_running(total: Duration, running: &AtomicBool, stats: &Stats) {
