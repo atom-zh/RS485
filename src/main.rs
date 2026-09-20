@@ -1027,10 +1027,9 @@ fn run_file_recv(
             Err(err) => return Err(err).context("file-recv 接收失败"),
         }
     }
-    if engine.inflight() {
-        if let Some(out) = engine.abort_idle()? {
-            let _ = finish_recv_outcome(rt, stats, &mut seq, out);
-        }
+    // Ctrl-C / SIGTERM：未收齐的文件不是传输质量失败，不记 FILE失败、不回 ACK。
+    if let Some(id) = engine.discard_inflight()? {
+        log_line(&format!("file xfer={id} 停止时未完成 未计入失败"));
     }
     Ok(())
 }

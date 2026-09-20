@@ -358,6 +358,18 @@ impl RecvEngine {
         Ok(Some(self.fail_incomplete("收片超时")?))
     }
 
+    /// 进程退出时丢掉未完成传输：不记失败、不保留 `fail-xfer*`、不产生 ACK。
+    pub fn discard_inflight(&mut self) -> io::Result<Option<u32>> {
+        let Some(cur) = self.current.take() else {
+            return Ok(None);
+        };
+        drop(cur.file);
+        if cur.path.exists() {
+            let _ = fs::remove_file(&cur.path);
+        }
+        Ok(Some(cur.xfer_id))
+    }
+
     fn on_meta(
         &mut self,
         xfer_id: u32,
@@ -621,6 +633,31 @@ mod tests {
         let h = md5_bytes(b"abc");
         assert_eq!(parse_md5_hex(&md5_hex(&h)).unwrap(), h);
         assert!(parse_md5_hex("zz").is_err());
+    }
+
+    #[test]
+    fn discard_inflight_does_not_keep_or_fail() {
+        let dir = temp_dir();
+        let mut eng = RecvEngine::new(dir.clone(), None, 16).unwrap();
+        let data = vec![1u8, 2, 3, 4];
+        eng.feed(meta(0, &data, 2)).unwrap();
+        eng.feed(FileMsg::Data {
+            xfer_id: 0,
+            chunk_idx: 0,
+            data: vec![1, 2],
+        })
+        .unwrap();
+        assert!(eng.inflight());
+        assert_eq!(eng.discard_inflight().unwrap(), Some(0));
+        assert!(!eng.inflight());
+        assert!(eng.golden().is_none());
+        assert!(!dir.join("recv-0.part").exists());
+        let leftover: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(leftover.is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
