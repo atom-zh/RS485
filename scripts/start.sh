@@ -9,6 +9,8 @@
 #   QUIET=1 CRC=1 MODE=recv ./scripts/start.sh
 #   MODE=traffic COUNT=1000 PAYLOAD=32 INTERVAL_MS=20 ./scripts/start.sh
 #   MODE=reverse ./scripts/start.sh
+#   MODE=file-send FILE=/opt/payload.bin ./scripts/start.sh
+#   MODE=file-recv DIR=/tmp/rs485-rx ./scripts/start.sh
 set -euo pipefail
 
 DEVICE="${DEVICE:-/dev/ttyHS3}"
@@ -25,6 +27,14 @@ COUNT="${COUNT:-0}"
 PAYLOAD="${PAYLOAD:-32}"
 INTERVAL_MS="${INTERVAL_MS:-20}"
 STATS_INTERVAL_MS="${STATS_INTERVAL_MS:-}"
+FILE="${FILE:-}"
+MD5="${MD5:-}"
+CHUNK="${CHUNK:-1024}"
+ACK_TIMEOUT_MS="${ACK_TIMEOUT_MS:-15000}"
+DIR="${DIR:-/tmp/rs485-rx}"
+EXPECT_MD5="${EXPECT_MD5:-}"
+IDLE_TIMEOUT_MS="${IDLE_TIMEOUT_MS:-5000}"
+MAX_FAIL_KEEP="${MAX_FAIL_KEEP:-16}"
 LOG="${LOG:-/tmp/rs485-test.log}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -109,7 +119,20 @@ case "$MODE" in
     cmd+=(traffic --count "$COUNT" --payload "$PAYLOAD" --interval-ms "$INTERVAL_MS")
     ;;
   reverse|test) cmd+=(reverse) ;;
-  *) die "未知 MODE=$MODE（duplex|echo|recv|send|traffic|reverse）" ;;
+  file-send)
+    [[ -n "$FILE" ]] || die "MODE=file-send 时请设置 FILE"
+    cmd+=(file-send --file "$FILE" --count "$COUNT" --chunk "$CHUNK" --interval-ms "$INTERVAL_MS" --ack-timeout-ms "$ACK_TIMEOUT_MS")
+    if [[ -n "$MD5" ]]; then
+      cmd+=(--md5 "$MD5")
+    fi
+    ;;
+  file-recv)
+    cmd+=(file-recv --dir "$DIR" --idle-timeout-ms "$IDLE_TIMEOUT_MS" --max-fail-keep "$MAX_FAIL_KEEP")
+    if [[ -n "$EXPECT_MD5" ]]; then
+      cmd+=(--expect-md5 "$EXPECT_MD5")
+    fi
+    ;;
+  *) die "未知 MODE=$MODE（duplex|echo|recv|send|traffic|reverse|file-send|file-recv）" ;;
 esac
 
 if [[ -n "$EXTRA_ARGS" ]]; then

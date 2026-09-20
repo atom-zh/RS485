@@ -1,7 +1,9 @@
+mod filexfer;
 mod frame;
 mod gpio;
 mod uart;
 
+use std::fs::File;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,6 +15,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serialport::{SerialPort, TTYPort};
 
+use crate::filexfer::{
+    chunk_count, encode_wire, md5_file, md5_hex, parse_md5_hex, parse_msgs, FeedResult, FileMsg,
+    RecvEngine, RecvOutcome, ACK_OK, DEFAULT_CHUNK, MAX_CHUNK,
+};
 use crate::frame::{encode, inspect, pattern_payload, FrameView, SeqTracker};
 use crate::gpio::Gpio;
 use crate::uart::{drain_available, open_port, read_frame, send_frame, IcountWatch, UartFormat};
@@ -104,6 +110,40 @@ enum Command {
     /// 测试：首帧 1～8 字节倒序回发并缓存，之后只比对；6s 无接收则补发缓存
     #[command(visible_alias = "test")]
     Reverse,
+    /// 循环分片发送文件，等待对端文件级 ACK
+    FileSend {
+        #[arg(long)]
+        file: PathBuf,
+        /// 期望 MD5（32 位 hex）；省略则按源文件计算
+        #[arg(long)]
+        md5: Option<String>,
+        /// 发送轮数，0 表示直到 Ctrl-C
+        #[arg(long, default_value_t = 0)]
+        count: u64,
+        /// 每片数据字节数
+        #[arg(long, default_value_t = DEFAULT_CHUNK)]
+        chunk: usize,
+        /// 片间隔（毫秒）
+        #[arg(long, default_value_t = 20)]
+        interval_ms: u64,
+        /// 等待 ACK 超时（毫秒）
+        #[arg(long, default_value_t = 15000)]
+        ack_timeout_ms: u64,
+    },
+    /// 循环接收文件：MD5 通过则删除，失败则保留
+    FileRecv {
+        #[arg(long, default_value = "/tmp/rs485-rx")]
+        dir: PathBuf,
+        /// 期望 MD5（32 位 hex）；省略则以第一份收齐的文件为基准
+        #[arg(long)]
+        expect_md5: Option<String>,
+        /// 收片空闲超时（毫秒）
+        #[arg(long, default_value_t = 5000)]
+        idle_timeout_ms: u64,
+        /// 最多保留的失败样本数
+        #[arg(long, default_value_t = 16)]
+        max_fail_keep: usize,
+    },
 }
 
 struct ReverseCache {
@@ -154,6 +194,10 @@ struct Stats {
     dup: AtomicU64,
     seq: Mutex<SeqTracker>,
     icount: IcountWatch,
+    file_ok: AtomicU64,
+    file_fail: AtomicU64,
+    ack_timeout: AtomicU64,
+    show_file: AtomicBool,
 }
 
 impl Stats {
@@ -174,7 +218,27 @@ impl Stats {
             dup: AtomicU64::new(0),
             seq: Mutex::new(SeqTracker::default()),
             icount,
+            file_ok: AtomicU64::new(0),
+            file_fail: AtomicU64::new(0),
+            ack_timeout: AtomicU64::new(0),
+            show_file: AtomicBool::new(false),
         }
+    }
+
+    fn enable_file_stats(&self) {
+        self.show_file.store(true, Ordering::Relaxed);
+    }
+
+    fn on_file_ok(&self) {
+        self.file_ok.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn on_file_fail(&self) {
+        self.file_fail.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn on_ack_timeout(&self) {
+        self.ack_timeout.fetch_add(1, Ordering::Relaxed);
     }
 
     fn on_rx(&self, data: &[u8]) {
@@ -279,6 +343,14 @@ impl Stats {
                 pct(lost, lost.saturating_add(ok))
             ));
         }
+        if self.show_file.load(Ordering::Relaxed) {
+            line.push_str(&format!(
+                "  FILE通过{} 失败{} ACK超时{}",
+                self.file_ok.load(Ordering::Relaxed),
+                self.file_fail.load(Ordering::Relaxed),
+                self.ack_timeout.load(Ordering::Relaxed)
+            ));
+        }
         log_line(&line);
     }
 
@@ -370,6 +442,38 @@ fn run() -> Result<()> {
             interval_ms,
         } => run_traffic(&mut rt, &running, &stats, count, payload, interval_ms)?,
         Command::Reverse => run_reverse(&mut rt, &running, &stats)?,
+        Command::FileSend {
+            file,
+            md5,
+            count,
+            chunk,
+            interval_ms,
+            ack_timeout_ms,
+        } => run_file_send(
+            &mut rt,
+            &running,
+            &stats,
+            file,
+            md5,
+            count,
+            chunk,
+            interval_ms,
+            ack_timeout_ms,
+        )?,
+        Command::FileRecv {
+            dir,
+            expect_md5,
+            idle_timeout_ms,
+            max_fail_keep,
+        } => run_file_recv(
+            &mut rt,
+            &running,
+            &stats,
+            dir,
+            expect_md5,
+            idle_timeout_ms,
+            max_fail_keep,
+        )?,
     }
 
     stats.print_counts("统计 ");
@@ -645,6 +749,313 @@ fn run_traffic(
         }
     }
     Ok(())
+}
+
+fn run_file_send(
+    rt: &mut Runtime,
+    running: &AtomicBool,
+    stats: &Stats,
+    path: PathBuf,
+    expect_md5: Option<String>,
+    count: u64,
+    chunk: usize,
+    interval_ms: u64,
+    ack_timeout_ms: u64,
+) -> Result<()> {
+    stats.enable_file_stats();
+    anyhow::ensure!(
+        chunk > 0 && chunk <= MAX_CHUNK,
+        "分片大小须在 1..={MAX_CHUNK}"
+    );
+    let file_size = std::fs::metadata(&path)
+        .with_context(|| format!("读取 {} 失败", path.display()))?
+        .len();
+    let nchunks = chunk_count(file_size, chunk).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let digest = md5_file(&path).with_context(|| format!("计算 {} MD5 失败", path.display()))?;
+    if let Some(raw) = expect_md5 {
+        let want = parse_md5_hex(&raw).map_err(|e| anyhow::anyhow!("{e}"))?;
+        anyhow::ensure!(
+            want == digest,
+            "源文件 MD5={} 与 --md5 {} 不一致",
+            md5_hex(&digest),
+            md5_hex(&want)
+        );
+    }
+    let name = {
+        let raw = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".to_string());
+        let bytes = raw.as_bytes();
+        if bytes.len() <= 255 {
+            raw
+        } else {
+            String::from_utf8_lossy(&bytes[..255]).into_owned()
+        }
+    };
+    let interval = Duration::from_millis(interval_ms);
+    let ack_timeout = Duration::from_millis(ack_timeout_ms);
+    log_line(&format!(
+        "file-send file={} size={file_size} md5={} chunks={nchunks} chunk={chunk} count={count} interval={interval_ms}ms ack_timeout={ack_timeout_ms}ms",
+        path.display(),
+        md5_hex(&digest)
+    ));
+    stats.info("mode=file-send  循环分片发送，等待 ACK。Ctrl-C 退出。");
+
+    let mut seq = 0u32;
+    let mut xfer_id = 0u32;
+    let mut sent = 0u64;
+    while running.load(Ordering::SeqCst) && (count == 0 || sent < count) {
+        send_one_file(
+            rt,
+            running,
+            stats,
+            &path,
+            &name,
+            file_size,
+            nchunks,
+            chunk,
+            digest,
+            xfer_id,
+            &mut seq,
+            interval,
+        )?;
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+        match wait_file_ack(rt, running, stats, xfer_id, ack_timeout)? {
+            AckWait::Ok(got) => {
+                stats.on_file_ok();
+                log_line(&format!(
+                    "file xfer={xfer_id} ACK通过 got={}",
+                    md5_hex(&got)
+                ));
+            }
+            AckWait::Fail(got) => {
+                stats.on_file_fail();
+                log_line(&format!(
+                    "file xfer={xfer_id} ACK失败 got={}",
+                    md5_hex(&got)
+                ));
+            }
+            AckWait::Timeout => {
+                stats.on_ack_timeout();
+                log_line(&format!("file xfer={xfer_id} ACK超时"));
+            }
+            AckWait::Stopped => break,
+        }
+        xfer_id = xfer_id.wrapping_add(1);
+        sent += 1;
+        stats.maybe_print();
+    }
+    Ok(())
+}
+
+fn send_one_file(
+    rt: &mut Runtime,
+    running: &AtomicBool,
+    stats: &Stats,
+    path: &std::path::Path,
+    name: &str,
+    file_size: u64,
+    nchunks: u32,
+    chunk: usize,
+    digest: [u8; 16],
+    xfer_id: u32,
+    seq: &mut u32,
+    interval: Duration,
+) -> Result<()> {
+    let meta = FileMsg::Meta {
+        xfer_id,
+        file_size,
+        chunk_count: nchunks,
+        md5: digest,
+        name: name.to_string(),
+    };
+    send_file_msg(rt, stats, seq, &meta)?;
+    if !interval.is_zero() {
+        sleep_while_running(interval, running, stats);
+    }
+    let mut file = File::open(path).with_context(|| format!("打开 {} 失败", path.display()))?;
+    let mut buf = vec![0u8; chunk];
+    let mut remain = file_size;
+    for idx in 0..nchunks {
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+        let want = (chunk as u64).min(remain) as usize;
+        file.read_exact(&mut buf[..want])
+            .with_context(|| format!("读取 {} 分片 {idx} 失败", path.display()))?;
+        remain -= want as u64;
+        let msg = FileMsg::Data {
+            xfer_id,
+            chunk_idx: idx,
+            data: buf[..want].to_vec(),
+        };
+        send_file_msg(rt, stats, seq, &msg)?;
+        if idx + 1 < nchunks && !interval.is_zero() {
+            sleep_while_running(interval, running, stats);
+        }
+    }
+    Ok(())
+}
+
+fn send_file_msg(
+    rt: &mut Runtime,
+    stats: &Stats,
+    seq: &mut u32,
+    msg: &FileMsg,
+) -> Result<()> {
+    let wire = encode_wire(*seq, msg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    send_frame(
+        &mut rt.port,
+        &rt.gpio,
+        &wire,
+        rt.tx_setup,
+        rt.tx_hold,
+    )?;
+    stats.on_tx(&wire);
+    *seq = seq.wrapping_add(1);
+    Ok(())
+}
+
+enum AckWait {
+    Ok([u8; 16]),
+    Fail([u8; 16]),
+    Timeout,
+    Stopped,
+}
+
+fn wait_file_ack(
+    rt: &mut Runtime,
+    running: &AtomicBool,
+    stats: &Stats,
+    xfer_id: u32,
+    timeout: Duration,
+) -> Result<AckWait> {
+    rt.gpio.set_rx()?;
+    let deadline = Instant::now() + timeout;
+    while running.load(Ordering::SeqCst) {
+        if Instant::now() >= deadline {
+            return Ok(AckWait::Timeout);
+        }
+        match read_frame(&mut rt.port, MAX_IDLE_FRAME) {
+            Ok(Some(raw)) => {
+                stats.on_rx(&raw);
+                for msg in parse_msgs(&raw) {
+                    if let FileMsg::Ack {
+                        xfer_id: id,
+                        result,
+                        got_md5,
+                    } = msg
+                    {
+                        if id == xfer_id {
+                            return Ok(if result == ACK_OK {
+                                AckWait::Ok(got_md5)
+                            } else {
+                                AckWait::Fail(got_md5)
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(None) => stats.maybe_print(),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err).context("等待文件 ACK 失败"),
+        }
+    }
+    Ok(AckWait::Stopped)
+}
+
+fn run_file_recv(
+    rt: &mut Runtime,
+    running: &AtomicBool,
+    stats: &Stats,
+    dir: PathBuf,
+    expect_md5: Option<String>,
+    idle_timeout_ms: u64,
+    max_fail_keep: usize,
+) -> Result<()> {
+    stats.enable_file_stats();
+    let preset = match expect_md5 {
+        Some(raw) => Some(parse_md5_hex(&raw).map_err(|e| anyhow::anyhow!("{e}"))?),
+        None => None,
+    };
+    let mut engine = RecvEngine::new(dir.clone(), preset, max_fail_keep)
+        .with_context(|| format!("创建接收目录 {} 失败", dir.display()))?;
+    let idle = Duration::from_millis(idle_timeout_ms);
+    let expect_txt = preset
+        .map(|m| md5_hex(&m))
+        .unwrap_or_else(|| "auto(首份收齐)".to_string());
+    log_line(&format!(
+        "file-recv dir={} expect_md5={expect_txt} idle_timeout={idle_timeout_ms}ms max_fail_keep={max_fail_keep}",
+        dir.display()
+    ));
+    stats.info("mode=file-recv  收齐后校验 MD5，通过删除、失败保留。Ctrl-C 退出。");
+    rt.gpio.set_rx()?;
+    let mut seq = 0u32;
+    while running.load(Ordering::SeqCst) {
+        match read_frame(&mut rt.port, MAX_IDLE_FRAME) {
+            Ok(Some(raw)) => {
+                stats.on_rx(&raw);
+                for msg in parse_msgs(&raw) {
+                    apply_recv_feed(rt, stats, &mut engine, &mut seq, msg)?;
+                }
+            }
+            Ok(None) => {
+                if let Some(t) = engine.last_activity() {
+                    if t.elapsed() >= idle {
+                        if let Some(out) = engine.abort_idle()? {
+                            finish_recv_outcome(rt, stats, &mut seq, out)?;
+                        }
+                    }
+                }
+                stats.maybe_print();
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err).context("file-recv 接收失败"),
+        }
+    }
+    if engine.inflight() {
+        if let Some(out) = engine.abort_idle()? {
+            let _ = finish_recv_outcome(rt, stats, &mut seq, out);
+        }
+    }
+    Ok(())
+}
+
+fn apply_recv_feed(
+    rt: &mut Runtime,
+    stats: &Stats,
+    engine: &mut RecvEngine,
+    seq: &mut u32,
+    msg: FileMsg,
+) -> Result<()> {
+    match engine.feed(msg).context("写入接收文件失败")? {
+        FeedResult::Nothing => Ok(()),
+        FeedResult::Done(out) => finish_recv_outcome(rt, stats, seq, out),
+        FeedResult::AbortedPrevious(out) => finish_recv_outcome(rt, stats, seq, out),
+    }
+}
+
+fn finish_recv_outcome(
+    rt: &mut Runtime,
+    stats: &Stats,
+    seq: &mut u32,
+    out: RecvOutcome,
+) -> Result<()> {
+    log_line(&out.log_line());
+    if out.passed {
+        stats.on_file_ok();
+    } else {
+        stats.on_file_fail();
+    }
+    let ack = FileMsg::Ack {
+        xfer_id: out.xfer_id,
+        result: out.ack_result(),
+        got_md5: out.got_md5,
+    };
+    send_file_msg(rt, stats, seq, &ack)
 }
 
 fn sleep_while_running(total: Duration, running: &AtomicBool, stats: &Stats) {

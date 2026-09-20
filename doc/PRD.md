@@ -39,7 +39,7 @@ QCM6125 上的 RS485 为半双工：同一物理链路不能同时发和收，�
 - 交叉编译出 **aarch64 musl 静态二进制**，拷到板子即可运行。
 - 默认适配本项目硬件：`/dev/ttyHS3` + GPIO123 + 115200 + `N8N1`。
 - 空闲时保持 RX，发送时按「拉低 → 等待 setup → 写串口 → tcdrain → 等待 hold → 拉高」切换。
-- 提供 duplex / echo / send / recv / traffic / reverse 六种工作模式。
+- 提供 duplex / echo / send / recv / traffic / reverse / file-send / file-recv 工作模式。
 - 可选按测试帧做 CRC、序号丢包/重复统计；利用内核 `TIOCGICOUNT` 报告帧错、奇偶、溢出。
 - 提供 `scripts/start.sh` / `scripts/stop.sh` 做后台启停，停止后 GPIO 回到 RX。
 
@@ -108,10 +108,12 @@ GPIO=1 (RX, 空闲)
 | F-MODE-04 | recv | GPIO 保持 RX，只收不发 |
 | F-MODE-05 | traffic | 连续发送带序号+CRC 的测试帧；`--count 0` 表示直到 Ctrl-C；可配 payload 长度与帧间隔 |
 | F-MODE-06 | reverse（别名 test） | 启动后第一帧 1～8 字节立即倒序回发并冻结缓存；之后只比对是否与首帧相同，相同则直接发缓存，不同则不回发、不改缓存。读到数据后用 `FIONREAD` 抽干内核已到字节（最多 8），不等待 `frame_idle_ms`。有缓存且超过 6 秒无接收则把缓存倒序主动发送一次，并重置静默计时（持续静默则每 6 秒一次）。本模式串口读超时约 10ms，仅用于轮询空闲与 Ctrl-C |
+| F-MODE-07 | file-send | 循环分片发送指定文件（默认 1024 字节/片、片间隔 20 ms）。启动时计算源文件 MD5 并写入 META；`--md5` 可选，传入则必须与本地计算结果一致。每轮发完等待文件级 ACK（默认 15 s），超时只记统计不中止。`--count 0` 直到 Ctrl-C |
+| F-MODE-08 | file-recv | 按 META/DATA 重组落盘。收齐后对磁盘文件算 MD5：有 `--expect-md5` 则每轮必须匹配；未传入则以**第一份收齐的文件**为基准并自动记录（半截/缺片/超时不记基准）。通过则删除，失败则保留 `fail-xfer*`（`--max-fail-keep` 默认 16）。随后回 ACK |
 
-空闲组帧规则（duplex / echo / recv）：读超时或读到 0 字节且缓冲区非空时，把已累积字节视为一帧；单帧上限 8192 字节。`reverse` 不走该规则。
+空闲组帧规则（duplex / echo / recv / file-send 的 ACK 等待 / file-recv）：读超时或读到 0 字节且缓冲区非空时，把已累积字节视为一帧；单帧上限 8192 字节。`reverse` 不走该规则。
 
-### 5.3 测试帧协议（仅 traffic 发送 / `--crc` 校验）
+### 5.3 测试帧协议（traffic / `--crc` / 文件传输载体）
 
 用于压测与质量统计，不是业务协议。
 
@@ -131,6 +133,16 @@ GPIO=1 (RX, 空闲)
 - 有魔数：按长度切分，CRC 错或长度不完整记失败。
 - 序号：首次帧建立期望值；超前记丢包数；落后（含重复）记 1 次重复。
 
+### 5.3.1 文件传输 payload（file-send / file-recv）
+
+仍走上述测试帧。payload 首字节为类型：
+
+- META `0x01`：`xfer_id u32` + `file_size u64` + `chunk_count u32` + `md5[16]` + `name_len u8` + `name`
+- DATA `0x02`：`xfer_id u32` + `chunk_idx u32` + `data`
+- ACK `0x03`：`xfer_id u32` + `result u8`（0 通过 / 1 失败）+ `got_md5[16]`
+
+每线上一帧只含一条消息。接收端以落盘内容的 MD5 为准，不盲信 META。未传 `--expect-md5` 时，第一份收齐的文件记为进程内基准。
+
 ### 5.4 统计与日志
 
 每条日志行前缀为本地墙钟毫秒时间。
@@ -148,6 +160,7 @@ GPIO=1 (RX, 空闲)
 - `RX {包}包 {字节}字节  TX {包}包 {字节}字节`
 - UART：`帧错` / `奇偶` / `溢出` 及相对 RX 字节的错误率；ioctl 不可用时打印 `UART计数=不可用`
 - `--crc` 时追加：`CRC通过` / `失败` / `丢包` / `重复` / `非测试帧`，以及帧错误率、丢包率
+- `file-send` / `file-recv` 追加：`FILE通过` / `FILE失败` / `ACK超时`。文件级事件（记录基准、通过删除、失败保留）即使 quiet 也打印。
 
 进程正常结束前再打印一行带 `统计 ` 前缀的汇总。
 
@@ -158,7 +171,7 @@ GPIO=1 (RX, 空闲)
 | F-OPS-01 | `scripts/compile.sh` 在 x86_64 主机交叉编译 `aarch64-unknown-linux-musl`，产物 `dist/rs485-test`，并检查尽量无动态 NEEDED |
 | F-OPS-02 | `scripts/start.sh` 必须 root；export GPIO、拉高 RX、后台启动、写 pid 文件、stdout/stderr 追加到日志 |
 | F-OPS-03 | `scripts/stop.sh` TERM → 等待 → 必要时 KILL，删除 pid，GPIO 拉回 RX |
-| F-OPS-04 | start 通过环境变量覆盖设备、GPIO、波特率、模式、quiet、crc、traffic 参数等 |
+| F-OPS-04 | start 通过环境变量覆盖设备、GPIO、波特率、模式、quiet、crc、traffic / file-send / file-recv 参数等 |
 
 ## 6. 非功能需求
 
@@ -182,11 +195,13 @@ GPIO=1 (RX, 空闲)
 7. 板上 `reverse`，对端反复发送同一段 1～8 字节，板上回倒序；超过 6 秒无接收则主动再发一次缓存倒序。
 8. `stop.sh` 后进程不在、GPIO value 为 1。
 9. 无 root 或设备不存在时，start 脚本在拉起前失败并给出原因。
+10. 两板 `file-send` / `file-recv`：不传 MD5 时，收端第一份收齐的文件被删除并记下基准；之后相同内容删除、故意改内容则保留 `fail-xfer*`。传入 `--expect-md5` 时第一轮不匹配也保留，不改基准。
 
 ## 8. 风险与约束
 
-- 半双工无冲突检测：两端同时发会破坏波形，echo/reverse/traffic 需约定主从。
-- `frame_idle_ms` 过小会把一帧拆成多段；过大则统计延迟增加。对端若连续发送无间隙，可能并成超大帧（上限 8192）。
+- 半双工无冲突检测：两端同时发会破坏波形，echo/reverse/traffic/file-send 需约定主从（一侧 file-send，一侧 file-recv）。
+- `file-recv` 未传 `--expect-md5` 时，若第一份收齐的文件其实已损坏，基准会锁错，后续正确文件会被当成失败。
+- `frame_idle_ms` 过小会把一帧拆成多段；过大则统计延迟增加。对端若连续发送无间隙，可能并成超大帧（上限 8192）。file-send 默认片间隔 20 ms，避免粘包切断。
 - sysfs GPIO 在部分内核上已弃用；若板子只用 libgpiod 且无 sysfs，本期无法工作。
 - `TIOCGICOUNT` 依赖驱动实现，部分 tty 返回不可用，此时不阻断收发。
 - duplex 的 stdin 发送与 RX 线程抢同一把锁，高密度收包时发送会被短暂堵住，这是半双工的预期行为。

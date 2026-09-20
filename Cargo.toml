@@ -9,6 +9,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
 libc = "0.2"
+md-5 = "0.10"
 serialport = { version = "4.7", default-features = false }
 
 [profile.release]
