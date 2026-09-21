@@ -333,8 +333,13 @@ impl RecvOutcome {
                 .first_gap
                 .map(|g| g.to_string())
                 .unwrap_or_else(|| "-".to_string());
+            let bad = self
+                .kept_bad
+                .as_ref()
+                .map(|p| format!(" 坏帧={}", p.display()))
+                .unwrap_or_default();
             format!(
-                "file xfer={} 失败 原因={why} expect={expect} got={got} 已收片={}/{} 已写={}/{} 首处缺片={gap} 已保留 {kept}",
+                "file xfer={} 失败 原因={why} expect={expect} got={got} 已收片={}/{} 已写={}/{} 首处缺片={gap} 已保留 {kept}{bad}",
                 self.xfer_id,
                 self.got_chunks,
                 self.chunk_count,
@@ -1251,6 +1256,7 @@ mod tests {
             .to_string_lossy()
             .starts_with("fail-xfer3-bad"));
         assert_fail_log(&out);
+        assert!(out.log_line().contains("坏帧="));
         let _ = fs::remove_dir_all(&dir);
 
         let dir = temp_dir();

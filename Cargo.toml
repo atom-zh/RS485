@@ -15,3 +15,7 @@ serialport = { version = "4.7", default-features = false }
 [profile.release]
 lto = false
 strip = true
+
+# 只约束本 crate，依赖警告不升级。避免 release 出现未使用字段等死代码警告。
+[lints.rust]
+warnings = "deny"

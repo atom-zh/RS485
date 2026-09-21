@@ -89,7 +89,7 @@ log "linker: $CROSS_GCC"
 log "添加 Rust target: $TARGET"
 rustup target add "$TARGET"
 
-log "开始编译 --release --target $TARGET"
+log "开始编译 --release --target $TARGET（本 crate 警告视为错误）"
 cargo build --release --target "$TARGET"
 
 BIN_SRC="$ROOT/target/$TARGET/release/rs485-test"
