@@ -145,7 +145,7 @@ enum Command {
         /// 收片空闲超时（毫秒），超时则本轮失败并保留
         #[arg(long, default_value_t = 5000)]
         idle_timeout_ms: u64,
-        /// 最多保留的失败样本数（fail-xfer*，不含 first-*）
+        /// 最多保留的失败轮次（按 fail-xfer*-got*.bin 计；同轮 .log/-bad.bin 一并清理，不含 first-*）
         #[arg(long, default_value_t = 16)]
         max_fail_keep: usize,
     },

@@ -615,15 +615,9 @@ impl RecvEngine {
             let _ = fs::remove_file(&cur.path);
             None
         } else {
-            Some(keep_fail(
-                &self.dir,
-                cur.xfer_id,
-                &got,
-                &cur.path,
-                self.max_fail_keep,
-            )?)
+            Some(keep_fail(&self.dir, cur.xfer_id, &got, &cur.path)?)
         };
-        Ok(RecvOutcome {
+        let out = RecvOutcome {
             xfer_id: cur.xfer_id,
             passed,
             recorded_golden,
@@ -641,7 +635,12 @@ impl RecvEngine {
             got_chunks: cur.got_chunks,
             chunk_count: cur.chunk_count,
             first_gap: gap,
-        })
+        };
+        if out.passed {
+            Ok(out)
+        } else {
+            finalize_fail_keep(&self.dir, self.max_fail_keep, out)
+        }
     }
 
     fn fail_incomplete(&mut self, why: &str) -> io::Result<RecvOutcome> {
@@ -656,28 +655,26 @@ impl RecvEngine {
             _ => why.to_string(),
         };
         let kept_bad = finalize_bad(&cur.bad_path, cur.xfer_id, false)?;
-        let kept = keep_fail(
+        let kept = keep_fail(&self.dir, cur.xfer_id, &got, &cur.path)?;
+        finalize_fail_keep(
             &self.dir,
-            cur.xfer_id,
-            &got,
-            &cur.path,
             self.max_fail_keep,
-        )?;
-        Ok(RecvOutcome {
-            xfer_id: cur.xfer_id,
-            passed: false,
-            recorded_golden: false,
-            got_md5: got,
-            expect_md5: self.expect_md5.or(self.golden),
-            kept_path: Some(kept),
-            kept_bad,
-            why: Some(detail),
-            written: cur.written,
-            file_size: cur.file_size,
-            got_chunks: cur.got_chunks,
-            chunk_count: cur.chunk_count,
-            first_gap: gap,
-        })
+            RecvOutcome {
+                xfer_id: cur.xfer_id,
+                passed: false,
+                recorded_golden: false,
+                got_md5: got,
+                expect_md5: self.expect_md5.or(self.golden),
+                kept_path: Some(kept),
+                kept_bad,
+                why: Some(detail),
+                written: cur.written,
+                file_size: cur.file_size,
+                got_chunks: cur.got_chunks,
+                chunk_count: cur.chunk_count,
+                first_gap: gap,
+            },
+        )
     }
 }
 
@@ -773,7 +770,6 @@ fn keep_fail(
     xfer_id: u32,
     got: &[u8; MD5_LEN],
     src: &Path,
-    max_fail_keep: usize,
 ) -> io::Result<PathBuf> {
     let prefix: String = md5_hex(got).chars().take(8).collect();
     let dest = dir.join(format!("fail-xfer{xfer_id}-got{prefix}.bin"));
@@ -785,30 +781,67 @@ fn keep_fail(
     } else {
         File::create(&dest)?;
     }
-    prune_fail_keep(dir, max_fail_keep)?;
     Ok(dest)
 }
 
+fn write_fail_log(bin_path: &Path, body: &str) -> io::Result<PathBuf> {
+    let log_path = bin_path.with_extension("log");
+    let mut file = File::create(&log_path)?;
+    writeln!(file, "{body}")?;
+    Ok(log_path)
+}
+
+fn finalize_fail_keep(
+    dir: &Path,
+    max_fail_keep: usize,
+    out: RecvOutcome,
+) -> io::Result<RecvOutcome> {
+    if let Some(kept) = out.kept_path.as_ref() {
+        write_fail_log(kept, &out.log_line())?;
+    }
+    prune_fail_keep(dir, max_fail_keep)?;
+    Ok(out)
+}
+
+/// `fail-xfer{id}-got{md5前8位}.bin` → xfer_id。其它 fail-* 不计名额。
+fn parse_fail_got_bin(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("fail-xfer")?;
+    let (id, suffix) = rest.split_once("-got")?;
+    if suffix.ends_with(".bin") && suffix.len() > 4 {
+        id.parse().ok()
+    } else {
+        None
+    }
+}
+
+fn remove_fail_round(dir: &Path, got_bin: &Path, xfer_id: u32) {
+    let log = got_bin.with_extension("log");
+    let bad = dir.join(format!("fail-xfer{xfer_id}-bad.bin"));
+    let _ = fs::remove_file(got_bin);
+    let _ = fs::remove_file(log);
+    let _ = fs::remove_file(bad);
+}
+
 fn prune_fail_keep(dir: &Path, max_keep: usize) -> io::Result<()> {
-    let mut files: Vec<(SystemTime, PathBuf)> = Vec::new();
+    let mut samples: Vec<(SystemTime, PathBuf, u32)> = Vec::new();
     if let Ok(rd) = fs::read_dir(dir) {
         for ent in rd.flatten() {
             let path = ent.path();
             let name = ent.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("fail-") {
+            if let Some(xfer_id) = parse_fail_got_bin(&name) {
                 let mtime = ent
                     .metadata()
                     .and_then(|m| m.modified())
                     .unwrap_or(SystemTime::UNIX_EPOCH);
-                files.push((mtime, path));
+                samples.push((mtime, path, xfer_id));
             }
         }
     }
-    files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    let extra = files.len().saturating_sub(max_keep);
-    for (_, path) in files.into_iter().take(extra) {
-        let _ = fs::remove_file(path);
+    samples.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let extra = samples.len().saturating_sub(max_keep);
+    for (_, path, xfer_id) in samples.into_iter().take(extra) {
+        remove_fail_round(dir, &path, xfer_id);
     }
     Ok(())
 }
@@ -864,6 +897,24 @@ mod tests {
             }
         }
         last.expect("应在最后一片完成")
+    }
+
+    fn assert_fail_log(out: &RecvOutcome) {
+        let kept = out.kept_path.as_ref().expect("失败应保留样本");
+        let log = kept.with_extension("log");
+        assert!(log.exists(), "应有同名 .log {}", log.display());
+        let body = fs::read_to_string(&log).unwrap();
+        assert_eq!(body, format!("{}\n", out.log_line()));
+        assert!(body.contains("原因="));
+    }
+
+    fn fail_got_names(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| parse_fail_got_bin(n).is_some())
+            .collect()
     }
 
     #[test]
@@ -956,7 +1007,9 @@ mod tests {
         assert!(!out.passed);
         assert!(!out.recorded_golden);
         assert!(eng.golden().is_none());
-        assert!(out.kept_path.unwrap().exists());
+        let kept = out.kept_path.clone().unwrap();
+        assert!(kept.exists());
+        assert_fail_log(&out);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -973,6 +1026,8 @@ mod tests {
         let kept = dir.join("first-xfer1.bin");
         assert_eq!(out.kept_path.as_ref(), Some(&kept));
         assert_eq!(fs::read(&kept).unwrap(), data);
+        assert!(!kept.with_extension("log").exists());
+        assert!(fail_got_names(&dir).is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -990,13 +1045,15 @@ mod tests {
         assert!(second.kept_path.is_none());
         assert!(!dir.join("recv-1.part").exists());
         assert!(dir.join("first-xfer0.bin").exists());
+        assert!(!dir.join("recv-1.log").exists());
 
         let other = b"DIFFERENT!!!!".to_vec();
         let third = feed_file(&mut eng, 2, &other, 5);
         assert!(!third.passed);
-        let kept = third.kept_path.unwrap();
+        let kept = third.kept_path.clone().unwrap();
         assert!(kept.exists());
         assert_eq!(fs::read(&kept).unwrap(), other);
+        assert_fail_log(&third);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1010,7 +1067,9 @@ mod tests {
         assert!(!out.passed);
         assert!(!out.recorded_golden);
         assert!(eng.golden().is_none());
-        assert!(out.kept_path.unwrap().exists());
+        let kept = out.kept_path.clone().unwrap();
+        assert!(kept.exists());
+        assert_fail_log(&out);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1069,9 +1128,10 @@ mod tests {
         assert!(eng.golden().is_none());
         assert_eq!(out.written, 4);
         assert_eq!(out.first_gap, Some(0));
-        let kept = out.kept_path.unwrap();
+        let kept = out.kept_path.clone().unwrap();
         assert!(kept.exists());
         assert_eq!(kept.metadata().unwrap().len(), 6);
+        assert_fail_log(&out);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1114,7 +1174,9 @@ mod tests {
             FeedResult::Done(out) => {
                 assert!(out.passed);
                 assert!(out.recorded_golden);
-                assert_eq!(fs::read(out.kept_path.unwrap()).unwrap(), data);
+                let kept = out.kept_path.unwrap();
+                assert_eq!(fs::read(&kept).unwrap(), data);
+                assert!(!kept.with_extension("log").exists());
             }
             other => panic!("{other:?}"),
         }
@@ -1154,7 +1216,9 @@ mod tests {
         {
             FeedResult::Done(out) => {
                 assert!(out.passed);
-                assert_eq!(fs::read(out.kept_path.unwrap()).unwrap(), data);
+                let kept = out.kept_path.unwrap();
+                assert_eq!(fs::read(&kept).unwrap(), data);
+                assert!(!kept.with_extension("log").exists());
             }
             other => panic!("{other:?}"),
         }
@@ -1179,13 +1243,14 @@ mod tests {
         .unwrap();
         let out = eng.abort_idle().unwrap().unwrap();
         assert!(!out.passed);
-        let bad = out.kept_bad.expect("应保留坏帧");
+        let bad = out.kept_bad.clone().expect("应保留坏帧");
         assert_eq!(fs::read(&bad).unwrap(), [0xff, 0x00]);
         assert!(bad
             .file_name()
             .unwrap()
             .to_string_lossy()
             .starts_with("fail-xfer3-bad"));
+        assert_fail_log(&out);
         let _ = fs::remove_dir_all(&dir);
 
         let dir = temp_dir();
@@ -1197,6 +1262,7 @@ mod tests {
         assert!(out.kept_bad.is_none());
         assert!(!dir.join("xfer4-bad.bin").exists());
         assert!(!dir.join("fail-xfer4-bad.bin").exists());
+        assert!(fail_got_names(&dir).is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1239,13 +1305,60 @@ mod tests {
             assert!(!out.passed);
         }
         assert!(dir.join("first-xfer0.bin").exists());
-        let fails: Vec<_> = fs::read_dir(&dir)
+        let got = fail_got_names(&dir);
+        assert_eq!(got.len(), 2);
+        for name in &got {
+            let bin = dir.join(name);
+            assert!(bin.with_extension("log").exists(), "{name} 应有同名 .log");
+        }
+        let logs: Vec<_> = fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("fail-"))
+            .filter(|n| n.starts_with("fail-") && n.ends_with(".log"))
             .collect();
-        assert_eq!(fails.len(), 2);
+        assert_eq!(logs.len(), 2);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_fail_removes_log_and_bad_together() {
+        let dir = temp_dir();
+        let mut eng = RecvEngine::new(dir.clone(), None, 1).unwrap();
+        let data = b"keep-first!!".to_vec();
+        let first = feed_file(&mut eng, 0, &data, 4);
+        assert!(first.recorded_golden);
+
+        let other = vec![1u8, 2, 3, 4];
+        eng.feed(meta(1, &other, 2)).unwrap();
+        eng.note_bad_frame("CRC错误", &[0xff]).unwrap();
+        let old = eng.abort_idle().unwrap().unwrap();
+        assert!(!old.passed);
+        let old_bin = old.kept_path.clone().unwrap();
+        let old_log = old_bin.with_extension("log");
+        let old_bad = old.kept_bad.clone().unwrap();
+        assert!(old_bin.exists());
+        assert!(old_log.exists());
+        assert!(old_bad.exists());
+
+        let newer = b"fail-payload-2!!".to_vec();
+        let kept = feed_file(&mut eng, 2, &newer, 4);
+        assert!(!kept.passed);
+        assert_fail_log(&kept);
+        assert!(!old_bin.exists());
+        assert!(!old_log.exists());
+        assert!(!old_bad.exists());
+        assert_eq!(fail_got_names(&dir).len(), 1);
+        assert!(dir.join("first-xfer0.bin").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_fail_got_bin_only_matches_sample() {
+        assert_eq!(parse_fail_got_bin("fail-xfer3-gota1b2c3d4.bin"), Some(3));
+        assert_eq!(parse_fail_got_bin("fail-xfer10-gotabcdef01.bin"), Some(10));
+        assert_eq!(parse_fail_got_bin("fail-xfer3-gota1b2c3d4.log"), None);
+        assert_eq!(parse_fail_got_bin("fail-xfer3-bad.bin"), None);
+        assert_eq!(parse_fail_got_bin("first-xfer3.bin"), None);
     }
 }

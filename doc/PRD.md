@@ -109,7 +109,7 @@ GPIO=1 (RX, 空闲)
 | F-MODE-05 | traffic | 连续发送带序号+CRC 的测试帧；`--count 0` 表示直到 Ctrl-C；可配 payload 长度与帧间隔 |
 | F-MODE-06 | reverse（别名 test） | 启动后第一帧 1～8 字节立即倒序回发并冻结缓存；之后只比对是否与首帧相同，相同则直接发缓存，不同则不回发、不改缓存。读到数据后用 `FIONREAD` 抽干内核已到字节（最多 8），不等待 `frame_idle_ms`。有缓存且超过 6 秒无接收则把缓存倒序主动发送一次，并重置静默计时（持续静默则每 6 秒一次）。本模式串口读超时约 10ms，仅用于轮询空闲与 Ctrl-C |
 | F-MODE-07 | file-send | 循环分片发送指定文件（默认 1024 字节/片、片间隔 20 ms）。启动时计算源文件 MD5 并写入 META；`--md5` 可选，传入则必须与本地计算结果一致。每轮发完等待文件级 ACK（默认 15 s），超时只记统计不中止。`--count 0` 直到 Ctrl-C |
-| F-MODE-08 | file-recv | 按片号把实际收到的字节写入（不补 0，同片只留第一次）。缺片/乱序/重复/坏帧不中止本轮，打诊断日志后继续收。全部片到齐、空闲超时或新 META 时结束并 ACK。收齐后 `fsync` + `posix_fadvise(DONTNEED)` 再算 MD5。有 `--expect-md5` 则每轮必须匹配、通过也不留 first；未传入则以第一份收齐文件为基准，保留 `first-xfer{id}.bin`（半截/超时不记基准）。之后通过则删除 `.part`，失败则保留 `fail-xfer*` 与可选 `-bad.bin`（`--max-fail-keep` 只清 `fail-*`）。ACK 发送失败不退出。Ctrl-C 丢弃未完成 `.part` |
+| F-MODE-08 | file-recv | 按片号把实际收到的字节写入（不补 0，同片只留第一次）。缺片/乱序/重复/坏帧不中止本轮，打诊断日志后继续收。全部片到齐、空闲超时或新 META 时结束并 ACK。收齐后 `fsync` + `posix_fadvise(DONTNEED)` 再算 MD5。有 `--expect-md5` 则每轮必须匹配、通过也不留 first；未传入则以第一份收齐文件为基准，保留 `first-xfer{id}.bin`（半截/超时不记基准）。之后通过则删除 `.part`，失败则保留 `fail-xfer*.bin`、同名 `.log`（正文与 stdout 失败行一致）与可选 `-bad.bin`（`--max-fail-keep` 按 `got*.bin` 轮次计，删一轮时带走 `.log` / `-bad.bin`）。ACK 发送失败不退出。Ctrl-C 丢弃未完成 `.part` |
 
 空闲组帧规则（duplex / echo / recv / file-send 的 ACK 等待 / file-recv）：读超时或读到 0 字节且缓冲区非空时，把已累积字节视为一帧；单帧上限 8192 字节。`reverse` 不走该规则。
 
@@ -195,7 +195,7 @@ GPIO=1 (RX, 空闲)
 7. 板上 `reverse`，对端反复发送同一段 1～8 字节，板上回倒序；超过 6 秒无接收则主动再发一次缓存倒序。
 8. `stop.sh` 后进程不在、GPIO value 为 1。
 9. 无 root 或设备不存在时，start 脚本在拉起前失败并给出原因。
-10. 两板 `file-send` / `file-recv`：不传 MD5 时，收端第一份收齐的文件保留为 `first-xfer*` 并记下基准；之后相同内容删除、故意改内容或未收齐则保留 `fail-xfer*`。传入 `--expect-md5` 时第一轮不匹配也保留失败样本，不改基准。缺片不中止本轮。
+10. 两板 `file-send` / `file-recv`：不传 MD5 时，收端第一份收齐的文件保留为 `first-xfer*` 并记下基准；之后相同内容删除、故意改内容或未收齐则保留 `fail-xfer*.bin` 与同名 `.log`。传入 `--expect-md5` 时第一轮不匹配也保留失败样本与日志，不改基准。缺片不中止本轮。
 
 ## 8. 风险与约束
 
